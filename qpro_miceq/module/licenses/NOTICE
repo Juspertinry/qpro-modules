@@ -1,0 +1,3 @@
+audio.primary.kona.so is MIT (QPRO_MICEQ) and statically links RNNoise 0.2 and
+speexdsp 1.2.1, both BSD 3-clause. Their notices are reproduced here as those
+licenses require for binary redistribution.
