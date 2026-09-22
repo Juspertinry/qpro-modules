@@ -1,0 +1,11 @@
+# Module scripts must reach the headset as LF. busybox ash fails on CRLF with a
+# bare "syntax error: unexpected 'do'", and a failed post-fs-data.sh is silent
+# for a whole boot cycle, so force LF rather than trusting core.autocrlf.
+* text=auto eol=lf
+
+*.img binary
+*.zip binary
+*.ko binary
+*.apk binary
+*.bin binary
+*.gz binary

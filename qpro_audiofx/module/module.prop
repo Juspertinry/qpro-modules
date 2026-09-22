@@ -1,0 +1,6 @@
+id=qpro_audiofx
+name=Quest Pro system audio effects
+version=v1
+versionCode=1
+author=Juspertinry
+description=Moves the primary output onto the deep-buffer usecase and unroutes the raw fast port, so every stream reaches the normal mixer where a system EQ can process it. Raises output latency to roughly 180-230ms. Quest Pro / seacliff.

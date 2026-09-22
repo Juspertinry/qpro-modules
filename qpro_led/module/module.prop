@@ -1,0 +1,6 @@
+id=questled
+name=Quest LED
+version=v1.1.0
+versionCode=3
+author=Juspertinry
+description=Rainbow cycle on the Quest status LED while awake; while asleep the LED shows battery level on a red-orange-green ramp. Settings live in /data/adb/questled.conf

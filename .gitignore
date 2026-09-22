@@ -1,0 +1,12 @@
+# Built zips are attached to releases, not committed.
+dist/
+*.zip
+
+# Stock configs and dumps pulled off the headset. Meta's, and reference only;
+# customize.sh regenerates from the device's own /vendor/etc.
+work/
+
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
