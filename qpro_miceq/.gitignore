@@ -1,0 +1,9 @@
+# Built zips are attached to Releases, not committed.
+dist/
+*.zip
+
+# Built tool binaries and the dev copy of the wrapper; module/ holds the shipped build.
+tools/pcmrec
+tools/pcmplay
+tools/dspmem
+hal/audio.primary.kona.so

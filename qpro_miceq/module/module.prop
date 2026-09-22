@@ -1,0 +1,6 @@
+id=qpro_miceq
+name=Quest Pro mic chain
+version=v0.1
+versionCode=1
+author=Juspertinry
+description=Replaces the mic processing with our own chain on the raw ADC feeds of all three mics: echo cancellation against the speakers, RNNoise, EQ, gate and compressor, all live-editable in /data/local/tmp/qpro_miceq/miceq.conf. Quest Pro / seacliff.
