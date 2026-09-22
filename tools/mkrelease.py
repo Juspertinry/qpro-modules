@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Build release zips with comments stripped from the shell scripts.
-
-tools/pack.py in each module is the development build and keeps comments. This
-is the release build. Stripping is line based and deliberately conservative:
-
-  - shebangs stay
-  - heredoc bodies stay, because one of them is the config file the module
-    writes to /data/adb and its comments are what the user reads
-  - multi-line single-quoted blocks stay, which is where the awk scripts live
-
-Every stripped script is checked two ways afterwards: it must still parse, and
-its non-comment lines must be byte identical to the original's.
-"""
 import pathlib
 import re
 import subprocess
