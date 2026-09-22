@@ -24,7 +24,7 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             continue
         arc = path.relative_to(mod).as_posix()
         data = path.read_bytes()
-        if b"\r\n" in data:
+        if path.suffix != ".so" and b"\r\n" in data:
             sys.exit(f"CRLF in {arc}, refusing to pack")
         z.writestr(arc, data)
 
