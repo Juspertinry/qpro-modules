@@ -30,6 +30,9 @@ struct chain {
 	int n_eq;
 
 	float gate_env;
+	float gate_gain;       // current gate gain, smoothed
+	int gate_open;
+	int gate_hold;         // samples of hold left
 	float comp_env;
 	struct chain_levels lv;
 };
@@ -158,6 +161,9 @@ void chain_configure(struct chain *c, const struct chain_conf *conf)
 			biquad_design(&c->eq[c->n_eq++], &conf->eq[i]);
 
 	c->gate_env = 0;
+	c->gate_gain = 1;
+	c->gate_open = 1;
+	c->gate_hold = 0;
 	c->comp_env = 0;
 }
 
@@ -237,17 +243,34 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out)
 			x[i] = biquad_run(&c->eq[n], x[i]);
 	c->lv.eq = lvl(x, CHAIN_FRAME, 1);
 
-	// gate: downward expander on a fast RMS envelope
+	// gate: opens above gate_db, closes gate_hyst_db below it after gate_hold_ms,
+	// and the gain moves smoothly so nothing clicks. Meant to separate a
+	// close-talking voice from people across the room.
 	if (k->gate_db < 0) {
-		float thr = db2lin(k->gate_db) * 32768.0f;
-		float range = db2lin(-(k->gate_range_db > 0 ? k->gate_range_db : 20));
-		float att = expf(-1.0f / (0.002f * CHAIN_RATE)), rel = expf(-1.0f / (0.080f * CHAIN_RATE));
+		float open_thr = db2lin(k->gate_db) * 32768.0f;
+		float close_thr = db2lin(k->gate_db - (k->gate_hyst_db > 0 ? k->gate_hyst_db : 6)) * 32768.0f;
+		float floor_g = db2lin(-(k->gate_range_db > 0 ? k->gate_range_db : 30));
+		int hold = (int)((k->gate_hold_ms > 0 ? k->gate_hold_ms : 200) * 0.001f * CHAIN_RATE);
+		// envelope: 1 ms attack, 40 ms release; gain: 2 ms open, 60 ms close
+		float env_att = expf(-1.0f / (0.001f * CHAIN_RATE)), env_rel = expf(-1.0f / (0.040f * CHAIN_RATE));
+		float g_open = expf(-1.0f / (0.002f * CHAIN_RATE)), g_close = expf(-1.0f / (0.060f * CHAIN_RATE));
 		for (int i = 0; i < CHAIN_FRAME; i++) {
 			float a = fabsf(x[i]);
-			c->gate_env = a > c->gate_env ? att * c->gate_env + (1 - att) * a
-						       : rel * c->gate_env + (1 - rel) * a;
-			float g = c->gate_env >= thr ? 1.0f : range + (1 - range) * (c->gate_env / thr);
-			x[i] *= g;
+			c->gate_env = a > c->gate_env ? env_att * c->gate_env + (1 - env_att) * a
+						       : env_rel * c->gate_env + (1 - env_rel) * a;
+			if (c->gate_env >= open_thr) {
+				c->gate_open = 1;
+				c->gate_hold = hold;
+			} else if (c->gate_open && c->gate_env < close_thr) {
+				if (c->gate_hold > 0)
+					c->gate_hold--;
+				else
+					c->gate_open = 0;
+			}
+			float target = c->gate_open ? 1.0f : floor_g;
+			float coef = target > c->gate_gain ? g_open : g_close;
+			c->gate_gain = coef * c->gate_gain + (1 - coef) * target;
+			x[i] *= c->gate_gain;
 		}
 	}
 

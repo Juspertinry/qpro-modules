@@ -24,8 +24,10 @@ struct chain_conf {
 	int ns;
 	float ns_mix;          // 0 = dry, 1 = fully denoised
 	struct eq_band eq[CHAIN_MAX_EQ];
-	float gate_db;         // 0 = off; downward expander threshold
-	float gate_range_db;
+	float gate_db;         // 0 = off; gate opens above this level (dBFS)
+	float gate_range_db;   // attenuation when closed
+	float gate_hold_ms;    // stays open this long after the level drops
+	float gate_hyst_db;    // closes this far below the open threshold
 	float comp_thr_db;     // 0 = off
 	float comp_ratio, comp_attack_ms, comp_release_ms, comp_makeup_db;
 	float gain_db;

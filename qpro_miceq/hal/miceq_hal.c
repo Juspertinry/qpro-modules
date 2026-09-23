@@ -75,7 +75,9 @@ static void conf_defaults(struct conf *c)
 	c->chain.aec_tail_ms = 64;
 	c->chain.aec_delay_ms = 40;
 	c->chain.ns_mix = 1;
-	c->chain.gate_range_db = 20;
+	c->chain.gate_range_db = 30;
+	c->chain.gate_hold_ms = 200;
+	c->chain.gate_hyst_db = 6;
 	c->chain.comp_ratio = 2;
 	c->chain.comp_attack_ms = 5;
 	c->chain.comp_release_ms = 80;
@@ -133,6 +135,8 @@ static void conf_apply(struct conf *c, const char *key, char *val)
 		b->q = n > 2 ? v[2] : 0.707f;
 	} else if (!strcmp(key, "gate_db")) k->gate_db = strtof(val, NULL);
 	else if (!strcmp(key, "gate_range_db")) k->gate_range_db = strtof(val, NULL);
+	else if (!strcmp(key, "gate_hold_ms")) k->gate_hold_ms = strtof(val, NULL);
+	else if (!strcmp(key, "gate_hyst_db")) k->gate_hyst_db = strtof(val, NULL);
 	else if (!strcmp(key, "comp")) {
 		// comp=threshold_db,ratio,attack_ms,release_ms,makeup_db
 		int n = split(val, v, 5);
