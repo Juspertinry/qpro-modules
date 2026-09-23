@@ -39,8 +39,11 @@
 
 // Our tap: MultiMedia10 front end, all TDM TX slots.
 #define TAP_PCM "/dev/snd/pcmC0D12c"
+// asked-for period; the q6 driver may pick another, and every read must be
+// exactly one period or its buffer bookkeeping breaks (EFAULT)
 #define TAP_PERIOD CHAIN_FRAME
-#define TAP_PERIODS 8
+#define TAP_PERIODS 8   // the driver's maximum; an overrun corrupts its buffer offsets
+static unsigned g_tap_period;   // what the driver actually granted
 #define RING_FRAMES (CHAIN_RATE / 2)
 #define TAP_GRACE_US 5000000
 
@@ -362,6 +365,14 @@ static int tap_open(void)
 		close(fd);
 		return -1;
 	}
+	g_tap_period = hp.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+	if (g_tap_period == 0 || g_tap_period > CHAIN_FRAME * 4) {
+		LOGE("tap: unusable period %u", g_tap_period);
+		close(fd);
+		return -1;
+	}
+	if (g_tap_period != TAP_PERIOD)
+		LOGI("tap: driver period %u frames", g_tap_period);
 	struct snd_pcm_sw_params sp;
 	memset(&sp, 0, sizeof(sp));
 	sp.period_step = 1;
@@ -391,13 +402,40 @@ static void *tap_main(void *arg)
 		if (sched_setaffinity(0, sizeof(set), &set))
 			LOGI("big-core affinity not applied: %s", strerror(errno));
 	}
-	int16_t buf[TAP_PERIOD * CHAIN_TAP_CH];
+	// FIFO of tap frames: one driver period in, one chain frame out
+	static int16_t fifo[CHAIN_FRAME * 6 * CHAIN_TAP_CH];
+	int16_t buf[CHAIN_FRAME * CHAIN_TAP_CH];
 	int16_t mono[CHAIN_FRAME];
+	unsigned have = 0;   // frames waiting in the FIFO
+	int fails = 0;  // consecutive read errors
 	int fd = -1;
 	struct chain *chain = chain_create();
+	struct chain_conf cur;
+	memset(&cur, 0, sizeof(cur));
 	int gen = -1;
 	int since_check = 0;
 	while (g_tap_run) {
+		if (gen != g_conf_gen) {
+			pthread_mutex_lock(&g_conf_lock);
+			struct chain_conf k = g_conf.chain;
+			gen = g_conf_gen;
+			pthread_mutex_unlock(&g_conf_lock);
+			// AEC/NS setup allocates and initializes models, which is too
+			// slow for the capture loop: drop the PCM around it. Everything
+			// else (EQ, gain, dynamics) is cheap and applies in place.
+			int heavy = k.aec != cur.aec || k.ns != cur.ns || k.source_dsp != cur.source_dsp ||
+				    k.aec_tail_ms != cur.aec_tail_ms || k.aec_delay_ms != cur.aec_delay_ms;
+			if (memcmp(&k, &cur, sizeof(k))) {
+				if (heavy && fd >= 0) {
+					close(fd);
+					fd = -1;
+					have = 0;
+				}
+				chain_configure(chain, &k);
+				dsp_select_slots(k.aec && !k.source_dsp);
+				cur = k;
+			}
+		}
 		if (fd < 0) {
 			fd = tap_open();
 			if (fd < 0) {
@@ -406,35 +444,50 @@ static void *tap_main(void *arg)
 			}
 			LOGI("tap running");
 		}
-		struct snd_xferi x = { .buf = buf, .frames = TAP_PERIOD };
+		if (have + g_tap_period > CHAIN_FRAME * 6)
+			have = 0;   // cannot happen with a sane period, but never overrun
+		struct snd_xferi x = { .buf = fifo + have * CHAIN_TAP_CH, .frames = g_tap_period };
 		if (ioctl(fd, SNDRV_PCM_IOCTL_READI_FRAMES, &x)) {
 			if (errno == EPIPE) {
 				ioctl(fd, SNDRV_PCM_IOCTL_PREPARE);
 				continue;
 			}
-			LOGE("tap read: %s", strerror(errno));
+			// EFAULT here is the q6 driver's "empty DSP buffer": the shared
+			// backend is being restarted by the HAL (audioserver opens and
+			// closes mic streams in bursts). Data resumes on its own, so
+			// wait it out; only a stream that stays dead gets reopened.
+			if (++fails < 6000) {   // 30 s; audioserver can take that long to bring streams up
+				if (fails == 1)
+					LOGI("tap: waiting for backend");
+				usleep(5000);
+				continue;
+			}
+			LOGE("tap read: %s, reopening", strerror(errno));
 			close(fd);
 			fd = -1;
+			fails = 0;
 			usleep(200000);
 			continue;
 		}
-		if (x.result != TAP_PERIOD)
-			continue;
-
-		if (gen != g_conf_gen) {
-			pthread_mutex_lock(&g_conf_lock);
-			struct chain_conf k = g_conf.chain;
-			gen = g_conf_gen;
-			pthread_mutex_unlock(&g_conf_lock);
-			chain_configure(chain, &k);
-			dsp_select_slots(k.aec && !k.source_dsp);
+		if (fails) {
+			LOGI("tap read ok after %d retries", fails);
+			fails = 0;
 		}
+		have += (unsigned)x.result;
+		if (have < CHAIN_FRAME)
+			continue;
+		memcpy(buf, fifo, sizeof(buf));
+		have -= CHAIN_FRAME;
+		memmove(fifo, fifo + CHAIN_FRAME * CHAIN_TAP_CH, have * CHAIN_TAP_CH * sizeof(int16_t));
+
 		if (++since_check >= 100) {   // once a second
 			since_check = 0;
-			codec_ensure_6slot();
-			conf_reload();
-			if (!g_conf.debug && g_tap_users == 0)
-				break;      // debug run: stop when debug is switched off
+			if (g_tap_users == 0) {
+				// debug run with no streams: nobody else polls the config
+				conf_reload();
+				if (!g_conf.debug)
+					break;
+			}
 		}
 		chain_process(chain, buf, mono);
 		if (g_conf.dump == 2)
@@ -532,6 +585,17 @@ static ssize_t wrapped_read(struct audio_stream_in *stream, void *buffer, size_t
 	if (got <= 0)
 		return got;
 	conf_reload();
+	{
+		// the stock firmware table resets the codec to 2 TX slots on every
+		// power-up, so re-check about once a second from here, off the
+		// capture thread (it is an I2C transaction through the DSP)
+		static uint64_t frames_since_check;
+		frames_since_check += (size_t)got / (2 * c->channels);
+		if (frames_since_check >= CHAIN_RATE) {
+			frames_since_check = 0;
+			codec_ensure_6slot();
+		}
+	}
 
 	unsigned ch = c->channels;
 	size_t frames = (size_t)got / (2 * ch);
