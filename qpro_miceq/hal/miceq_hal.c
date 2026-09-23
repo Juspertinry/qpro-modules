@@ -317,6 +317,11 @@ static int16_t g_ring[RING_FRAMES];   // processed mono
 static uint64_t g_ring_wr;           // total frames written
 static volatile int g_tap_run;
 static volatile int g_tap_alive;
+// The HAL restarts the shared backend when it opens or closes a stream, which
+// empties our front end (EFAULT storm). Around those events the tap is paused:
+// its PCM is closed before the HAL touches the backend and reopened once the
+// hooked stream is delivering data again.
+static volatile int g_tap_pause;
 static int g_tap_users;
 static struct timespec g_tap_last_close;
 
@@ -416,6 +421,16 @@ static void *tap_main(void *arg)
 	int gen = -1;
 	int since_check = 0;
 	while (g_tap_run) {
+		if (g_tap_pause) {
+			if (fd >= 0) {
+				close(fd);
+				fd = -1;
+				have = 0;
+				had_data = 0;
+			}
+			usleep(5000);
+			continue;
+		}
 		if (gen != g_conf_gen) {
 			pthread_mutex_lock(&g_conf_lock);
 			struct chain_conf k = g_conf.chain;
@@ -565,11 +580,33 @@ static void tap_idle_check(void)
 
 #define MAX_STREAMS 8
 
+#define INLINE_FIFO (CHAIN_FRAME * 8)
+
 struct stream_ctx {
 	struct audio_stream_in *stream;
 	ssize_t (*orig_read)(struct audio_stream_in *, void *, size_t);
-	unsigned channels;
-	uint64_t ring_rd;
+	unsigned channels;          // what the app asked for (1 or 2)
+	uint64_t ring_rd;           // tap path: position in the shared ring
+
+	// inline path: the stock HAL captures all six slots on this very stream
+	int inline6;
+	uint32_t app_mask;
+	audio_channel_mask_t (*orig_get_channels)(const struct audio_stream *);
+	size_t (*orig_get_buffer_size)(const struct audio_stream *);
+	int16_t *tmp;
+	size_t tmp_frames;
+	int16_t infifo[INLINE_FIFO * CHAIN_TAP_CH];
+	unsigned in_have;
+	int16_t outfifo[INLINE_FIFO];
+	unsigned out_have;
+	struct chain *chain;
+	int chain_gen;
+	// chain rebuilds allocate models, too slow for the HAL's read: a helper
+	// thread builds the replacement and the read swaps it in
+	struct chain *pending;
+	pthread_t builder;
+	int building;
+	int builder_gen;
 };
 
 static struct stream_ctx g_streams[MAX_STREAMS];
@@ -583,15 +620,119 @@ static struct stream_ctx *ctx_find(struct audio_stream_in *s)
 	return NULL;
 }
 
+static void *chain_builder(void *arg)
+{
+	struct stream_ctx *c = arg;
+	pthread_mutex_lock(&g_conf_lock);
+	struct chain_conf k = g_conf.chain;
+	int gen = g_conf_gen;
+	pthread_mutex_unlock(&g_conf_lock);
+	struct chain *n = chain_create();
+	chain_configure(n, &k);
+	dsp_select_slots(k.aec && !k.source_dsp);
+	pthread_mutex_lock(&g_streams_lock);
+	c->pending = n;
+	c->builder_gen = gen;
+	pthread_mutex_unlock(&g_streams_lock);
+	return NULL;
+}
+
+static audio_channel_mask_t wrapped_get_channels(const struct audio_stream *st)
+{
+	struct stream_ctx *c = ctx_find((struct audio_stream_in *)st);
+	return c ? c->app_mask : 0x10;
+}
+
+static size_t wrapped_get_buffer_size(const struct audio_stream *st)
+{
+	struct stream_ctx *c = ctx_find((struct audio_stream_in *)st);
+	if (!c)
+		return 0;
+	size_t six = c->orig_get_buffer_size(st);
+	return six / (CHAIN_TAP_CH * 2) * (2 * c->channels);
+}
+
+static ssize_t inline_read(struct stream_ctx *c, void *buffer, size_t bytes)
+{
+	unsigned ch = c->channels;
+	size_t frames = bytes / (2 * ch);
+	if (c->tmp_frames < frames) {
+		free(c->tmp);
+		c->tmp = malloc(frames * CHAIN_TAP_CH * 2);
+		c->tmp_frames = frames;
+	}
+	ssize_t got = c->orig_read(c->stream, c->tmp, frames * CHAIN_TAP_CH * 2);
+	if (got <= 0)
+		return got;
+	size_t nf = (size_t)got / (CHAIN_TAP_CH * 2);
+
+	conf_reload();
+	if (c->pending && c->builder_gen == g_conf_gen) {
+		pthread_join(c->builder, NULL);
+		chain_destroy(c->chain);
+		c->chain = c->pending;
+		c->pending = NULL;
+		c->building = 0;
+		c->chain_gen = c->builder_gen;
+	} else if (c->pending) {
+		// config moved on while building; build again
+		pthread_join(c->builder, NULL);
+		chain_destroy(c->pending);
+		c->pending = NULL;
+		c->building = 0;
+	}
+	if (c->chain_gen != g_conf_gen && !c->building) {
+		c->building = 1;
+		pthread_create(&c->builder, NULL, chain_builder, c);
+	}
+
+	// feed the six-channel frames through the chain in 10 ms blocks
+	for (size_t i = 0; i < nf; i++) {
+		if (c->in_have >= INLINE_FIFO)
+			break;
+		memcpy(c->infifo + c->in_have * CHAIN_TAP_CH, c->tmp + i * CHAIN_TAP_CH, CHAIN_TAP_CH * 2);
+		c->in_have++;
+		if (c->in_have == CHAIN_FRAME) {
+			int16_t mono[CHAIN_FRAME];
+			if (c->chain)
+				chain_process(c->chain, c->infifo, mono);
+			else
+				memset(mono, 0, sizeof(mono));
+			if (c->out_have + CHAIN_FRAME <= INLINE_FIFO) {
+				memcpy(c->outfifo + c->out_have, mono, sizeof(mono));
+				c->out_have += CHAIN_FRAME;
+			}
+			c->in_have = 0;
+		}
+	}
+
+	// hand out what is ready; the first 10 ms are silence while the block fills
+	int16_t *out = buffer;
+	size_t n = c->out_have < frames ? c->out_have : frames;
+	for (size_t i = 0; i < n; i++)
+		for (unsigned k = 0; k < ch; k++)
+			out[i * ch + k] = c->outfifo[i];
+	if (n < frames)
+		memset(out + n * ch, 0, (frames - n) * ch * 2);
+	c->out_have -= n;
+	memmove(c->outfifo, c->outfifo + n, c->out_have * 2);
+	if (g_conf.dump == 1)
+		dump_write(buffer, frames * ch * 2);
+	return frames * ch * 2;
+}
+
 static ssize_t wrapped_read(struct audio_stream_in *stream, void *buffer, size_t bytes)
 {
 	struct stream_ctx *c = ctx_find(stream);
 	if (!c)
 		return -ENODEV;
+	if (c->inline6)
+		return inline_read(c, buffer, bytes);
 	// The stock read paces us and keeps the HAL's stream state sane.
 	ssize_t got = c->orig_read(stream, buffer, bytes);
 	if (got <= 0)
 		return got;
+	g_tap_pause = 0;
 	conf_reload();
 	{
 		// the stock firmware table resets the codec to 2 TX slots on every
@@ -643,15 +784,50 @@ static int wrapped_open_input_stream(struct audio_hw_device *dev, audio_io_handl
 	audio_input_flags_t flags, const char *address, audio_source_t source)
 {
 	conf_reload();
+	g_tap_pause = 1;
 	ctl_set("PRI_TDM_TX_0 Channels", "Six");
 	codec_ensure_6slot();
-	int ret = orig_open_input_stream(dev, handle, devices, config, stream_in, flags, address, source);
-	if (ret || !*stream_in)
-		return ret;
+
+	// Preferred: have the stock HAL capture all six slots on this stream so
+	// there is one capture path that lives and dies with the app's stream.
+	uint32_t app_mask = config ? config->channel_mask : 0x10;
+	unsigned app_ch = __builtin_popcount(app_mask & 0x7fffffff);
+	int inline6 = 0;
+	int ret = -1;
+	if (config && config->format == AUDIO_FORMAT_PCM_16_BIT && config->sample_rate == CHAIN_RATE &&
+	    app_ch >= 1 && app_ch <= 2) {
+		const uint32_t masks[] = { AUDIO_CHANNEL_INDEX_MASK_6, AUDIO_CHANNEL_IN_5POINT1 };
+		for (unsigned m = 0; m < 2 && !inline6; m++) {
+			config->channel_mask = masks[m];
+			ret = orig_open_input_stream(dev, handle, devices, config, stream_in, flags, address, source);
+			if (ret == 0 && *stream_in) {
+				struct audio_stream_in *s = *stream_in;
+				unsigned got = __builtin_popcount(s->common.get_channels(&s->common) & 0x7fffffff);
+				if (got == CHAIN_TAP_CH && s->common.get_format(&s->common) == AUDIO_FORMAT_PCM_16_BIT &&
+				    s->common.get_sample_rate(&s->common) == CHAIN_RATE) {
+					inline6 = 1;
+				} else {
+					LOGI("handle %d: 6ch open gave %u ch, not usable", handle, got);
+					orig_close_input_stream(dev, s);
+					*stream_in = NULL;
+				}
+			} else {
+				LOGI("handle %d: 6ch open with mask 0x%x refused (%d)", handle, masks[m], ret);
+			}
+		}
+		config->channel_mask = app_mask;
+	}
+	if (!inline6) {
+		if (config)
+			config->channel_mask = app_mask;
+		ret = orig_open_input_stream(dev, handle, devices, config, stream_in, flags, address, source);
+		if (ret || !*stream_in)
+			return ret;
+	}
 	struct audio_stream_in *s = *stream_in;
-	unsigned ch = __builtin_popcount(s->common.get_channels(&s->common));
-	if (s->common.get_format(&s->common) != AUDIO_FORMAT_PCM_16_BIT || ch == 0 || ch > 2 ||
-	    s->common.get_sample_rate(&s->common) != CHAIN_RATE) {
+	unsigned ch = inline6 ? app_ch : __builtin_popcount(s->common.get_channels(&s->common));
+	if (!inline6 && (s->common.get_format(&s->common) != AUDIO_FORMAT_PCM_16_BIT || ch == 0 || ch > 2 ||
+	    s->common.get_sample_rate(&s->common) != CHAIN_RATE)) {
 		LOGI("input stream handle %d: format not handled, passing through", handle);
 		return ret;
 	}
@@ -659,15 +835,35 @@ static int wrapped_open_input_stream(struct audio_hw_device *dev, audio_io_handl
 	tap_idle_check();
 	struct stream_ctx *c = ctx_find(NULL);
 	if (c) {
+		memset(c, 0, sizeof(*c));
 		c->stream = s;
 		c->orig_read = s->read;
 		c->channels = ch;
-		c->ring_rd = 0;
+		c->inline6 = inline6;
 		s->read = wrapped_read;
-		tap_start();
-		LOGI("hooked input stream handle %d source %d ch %u", handle, source, ch);
+		if (inline6) {
+			c->app_mask = app_mask;
+			c->orig_get_channels = s->common.get_channels;
+			c->orig_get_buffer_size = s->common.get_buffer_size;
+			s->common.get_channels = wrapped_get_channels;
+			s->common.get_buffer_size = wrapped_get_buffer_size;
+			c->chain_gen = -1;   // first read schedules the build
+			LOGI("hooked input stream handle %d source %d ch %u: inline 6ch capture", handle, source, ch);
+		} else {
+			tap_start();
+			LOGI("hooked input stream handle %d source %d ch %u: tap fallback", handle, source, ch);
+		}
+		pthread_mutex_unlock(&g_streams_lock);
+		return 0;
 	}
 	pthread_mutex_unlock(&g_streams_lock);
+	if (inline6) {
+		// no slot to track it; the HAL would hand the app six channels
+		orig_close_input_stream(dev, s);
+		*stream_in = NULL;
+		config->channel_mask = app_mask;
+		return orig_open_input_stream(dev, handle, devices, config, stream_in, flags, address, source);
+	}
 	return ret;
 }
 
@@ -677,11 +873,27 @@ static void wrapped_close_input_stream(struct audio_hw_device *dev, struct audio
 	struct stream_ctx *c = ctx_find(s);
 	if (c) {
 		s->read = c->orig_read;
+		if (c->inline6) {
+			s->common.get_channels = c->orig_get_channels;
+			s->common.get_buffer_size = c->orig_get_buffer_size;
+			if (c->building)
+				pthread_join(c->builder, NULL);
+			chain_destroy(c->pending);
+			chain_destroy(c->chain);
+			free(c->tmp);
+		} else {
+			tap_stop();
+		}
 		memset(c, 0, sizeof(*c));
-		tap_stop();
 	}
 	pthread_mutex_unlock(&g_streams_lock);
+	g_tap_pause = 1;
 	orig_close_input_stream(dev, s);
+	// no hooked stream left to signal the backend is back; let the tap try
+	pthread_mutex_lock(&g_streams_lock);
+	if (!ctx_find(NULL) || g_tap_users == 0)
+		g_tap_pause = 0;
+	pthread_mutex_unlock(&g_streams_lock);
 }
 
 // ---- module glue ------------------------------------------------------------------

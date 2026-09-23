@@ -78,7 +78,15 @@ struct audio_stream_in {
 	void *update_sink_metadata_v7;
 };
 
-struct audio_config;
+// only the leading fields are touched; the rest is passed through untouched
+struct audio_config {
+	uint32_t sample_rate;
+	uint32_t channel_mask;
+	uint32_t format;
+};
+#define AUDIO_CHANNEL_INDEX_MASK_6 0x8000003fu
+#define AUDIO_CHANNEL_IN_5POINT1 0x00000fccu
+#define AUDIO_SOURCE_UNPROCESSED 9
 
 struct audio_hw_device {
 	struct hw_device_t common;
