@@ -407,6 +407,7 @@ static void *tap_main(void *arg)
 	int16_t buf[CHAIN_FRAME * CHAIN_TAP_CH];
 	int16_t mono[CHAIN_FRAME];
 	unsigned have = 0;   // frames waiting in the FIFO
+	int had_data = 0;    // this PCM has delivered at least one period
 	int fails = 0;  // consecutive read errors
 	int fd = -1;
 	struct chain *chain = chain_create();
@@ -452,20 +453,24 @@ static void *tap_main(void *arg)
 				ioctl(fd, SNDRV_PCM_IOCTL_PREPARE);
 				continue;
 			}
-			// EFAULT here is the q6 driver's "empty DSP buffer": the shared
-			// backend is being restarted by the HAL (audioserver opens and
-			// closes mic streams in bursts). Data resumes on its own, so
-			// wait it out; only a stream that stays dead gets reopened.
-			if (++fails < 6000) {   // 30 s; audioserver can take that long to bring streams up
+			// EFAULT here is the q6 driver's "empty DSP buffer". Two causes:
+			// the backend is being restarted by the HAL (audioserver opens
+			// and closes mic streams in bursts), where data resumes on its
+			// own and waiting is right; or this PCM was opened before the
+			// backend was routed, where only a reopen helps. Tell them apart
+			// by whether data has ever flowed.
+			if (++fails < (had_data ? 6000 : 200)) {
 				if (fails == 1)
 					LOGI("tap: waiting for backend");
 				usleep(5000);
 				continue;
 			}
-			LOGE("tap read: %s, reopening", strerror(errno));
+			if (had_data)
+				LOGE("tap read: %s, reopening", strerror(errno));
 			close(fd);
 			fd = -1;
 			fails = 0;
+			had_data = 0;
 			usleep(200000);
 			continue;
 		}
@@ -473,6 +478,7 @@ static void *tap_main(void *arg)
 			LOGI("tap read ok after %d retries", fails);
 			fails = 0;
 		}
+		had_data = 1;
 		have += (unsigned)x.result;
 		if (have < CHAIN_FRAME)
 			continue;
