@@ -41,5 +41,5 @@ void chain_configure(struct chain *c, const struct chain_conf *conf);
 // Process exactly CHAIN_FRAME tap frames (interleaved 6 x int16) into mono.
 void chain_process(struct chain *c, const int16_t *tap, int16_t *out);
 // Levels (dBFS) of the last processed frame at each stage, for debugging.
-struct chain_levels { float sum, ref, aec, ns, eq, out; };
+struct chain_levels { float sum, ref, aec, ns, eq, out; int aec_resets; };
 void chain_levels(const struct chain *c, struct chain_levels *l);

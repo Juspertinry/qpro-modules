@@ -205,8 +205,20 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out)
 			play[i] = (tap[i * CHAIN_TAP_CH + 0] + tap[i * CHAIN_TAP_CH + 1]) / 2;
 		}
 		speex_echo_cancellation(c->aec, rec, play, est);
-		for (int i = 0; i < CHAIN_FRAME; i++)
-			x[i] = est[i];
+		// an adaptive filter that diverges makes things louder, never
+		// quieter: treat that as broken, pass the input and start over
+		float in_e = 0, out_e = 0;
+		for (int i = 0; i < CHAIN_FRAME; i++) {
+			in_e += (float)rec[i] * rec[i];
+			out_e += (float)est[i] * est[i];
+		}
+		if (out_e > in_e * 2.0f + 1e3f) {
+			speex_echo_state_reset(c->aec);
+			c->lv.aec_resets++;
+		} else {
+			for (int i = 0; i < CHAIN_FRAME; i++)
+				x[i] = est[i];
+		}
 	}
 	c->lv.aec = lvl(x, CHAIN_FRAME, 1);
 

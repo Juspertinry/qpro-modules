@@ -459,7 +459,9 @@ static void *tap_main(void *arg)
 			// own and waiting is right; or this PCM was opened before the
 			// backend was routed, where only a reopen helps. Tell them apart
 			// by whether data has ever flowed.
-			if (++fails < (had_data ? 6000 : 200)) {
+			// Reopening is cheap now that the buffer is 80 ms and chain
+			// setup is outside this loop, so do not wait long either way.
+			if (++fails < 400) {
 				if (fails == 1)
 					LOGI("tap: waiting for backend");
 				usleep(5000);
@@ -608,15 +610,21 @@ static ssize_t wrapped_read(struct audio_stream_in *stream, void *buffer, size_t
 	int16_t *out = buffer;
 
 	pthread_mutex_lock(&g_ring_lock);
-	// Follow the writer with a small fixed lag; resync if we fall out of range.
-	if (c->ring_rd + frames > g_ring_wr || g_ring_wr - c->ring_rd > RING_FRAMES / 2)
+	// Follow the writer with a small fixed lag. Never hand out data twice:
+	// when the tap stalls (backend restart) the missing part is silence, not
+	// a repeat of the last frame.
+	if (c->ring_rd > g_ring_wr || g_ring_wr - c->ring_rd > RING_FRAMES / 2)
 		c->ring_rd = g_ring_wr > frames + CHAIN_FRAME ? g_ring_wr - frames - CHAIN_FRAME : 0;
-	for (size_t i = 0; i < frames; i++) {
+	size_t avail = (size_t)(g_ring_wr - c->ring_rd);
+	size_t n = avail < frames ? avail : frames;
+	for (size_t i = 0; i < n; i++) {
 		int16_t s = g_ring[(c->ring_rd + i) % RING_FRAMES];
 		for (unsigned k = 0; k < ch; k++)
 			out[i * ch + k] = s;
 	}
-	c->ring_rd += frames;
+	if (n < frames)
+		memset(out + n * ch, 0, (frames - n) * ch * sizeof(int16_t));
+	c->ring_rd += n;
 	pthread_mutex_unlock(&g_ring_lock);
 	if (g_conf.dump == 1)
 		dump_write(buffer, got);
