@@ -48,9 +48,13 @@ static unsigned g_tap_period;   // what the driver actually granted
 #define TAP_GRACE_US 5000000
 
 #define CTL_DEV "/dev/snd/controlC0"
-#define CODEC_NODE "/sys/devices/platform/soc/a80000.i2c/i2c-0/0-002d/cm7120codec"
+#define CODEC_DIR "/sys/devices/platform/soc/a80000.i2c/i2c-0/0-002d"
+#define CODEC_NODE CODEC_DIR "/cm7120codec"
+#define DSP_NODE CODEC_DIR "/cm7120dsp"
+#define DSP_MODE_NODE CODEC_DIR "/is_dsp_mode"
 #define TDM_CTRL1_REG 0x0038
 #define TDM_CTRL1_6SLOT 0x8ef0
+#define DSP_OUT_CONFIG 0x5ffc0004   // low byte: channel0 | channel1 << 4 selectors
 
 // ---- config -----------------------------------------------------------------
 
@@ -72,8 +76,15 @@ static void conf_defaults(struct conf *c)
 	memset(c, 0, sizeof(*c));
 	c->enabled = 1;
 	c->chain.mic_w[0] = 1;
-	c->chain.aec_tail_ms = 64;
-	c->chain.aec_delay_ms = 40;
+	c->chain.aec_stereo = 0;
+	c->chain.ref_sel[0] = 3;
+	c->chain.ref_sel[1] = 4;
+	c->chain.aec_tail_ms = 32;
+	c->chain.aec_delay_ms = 37;
+	c->chain.aec_delay_auto = 1;
+	c->chain.aec_res = 1;
+	c->chain.aec_res_db = -40;
+	c->chain.aec_res_active_db = -15;
 	c->chain.ns_mix = 1;
 	c->chain.gate_range_db = 30;
 	c->chain.gate_hold_ms = 200;
@@ -112,8 +123,23 @@ static void conf_apply(struct conf *c, const char *key, char *val)
 		for (int i = 0; i < n; i++)
 			k->mic_w[i] = v[i];
 	} else if (!strcmp(key, "aec")) k->aec = atoi(val);
+	else if (!strcmp(key, "aec_stereo")) k->aec_stereo = atoi(val);
+	else if (!strcmp(key, "aec_ref_sel")) {
+		// what the DSP dumps on slots 0/1: 0 processed, 1-3 raw Mic1-3, 3/4 echo ref
+		int n = split(val, v, 2);
+		for (int i = 0; i < n; i++)
+			k->ref_sel[i] = (int)v[i];
+	}
 	else if (!strcmp(key, "aec_tail_ms")) k->aec_tail_ms = atoi(val);
-	else if (!strcmp(key, "aec_delay_ms")) k->aec_delay_ms = atoi(val);
+	else if (!strcmp(key, "aec_delay_ms")) {
+		// "auto" measures it and tracks it; a number pins it
+		k->aec_delay_auto = !strncmp(val, "auto", 4);
+		if (!k->aec_delay_auto)
+			k->aec_delay_ms = atoi(val);
+	}
+	else if (!strcmp(key, "aec_res")) k->aec_res = atoi(val);
+	else if (!strcmp(key, "aec_res_db")) k->aec_res_db = -abs(atoi(val));
+	else if (!strcmp(key, "aec_res_active_db")) k->aec_res_active_db = -abs(atoi(val));
 	else if (!strcmp(key, "ns")) k->ns = atoi(val);
 	else if (!strcmp(key, "ns_mix")) k->ns_mix = strtof(val, NULL);
 	else if (!strncmp(key, "eq", 2) && key[2] >= '1' && key[2] <= '8' && !key[3]) {
@@ -194,9 +220,12 @@ static void conf_reload(void)
 	int neq = 0;
 	for (int i = 0; i < CHAIN_MAX_EQ; i++)
 		neq += c.chain.eq[i].type != EQ_OFF;
-	LOGI("config: enabled=%d src=%s mics=%.2f/%.2f/%.2f aec=%d ns=%d(%.2f) eq=%d gate=%.0f comp=%.0f gain=%.1f dump=%d",
+	LOGI("config: enabled=%d src=%s mics=%.2f/%.2f/%.2f aec=%d(st%d tail%d delay%s%d res%d sel%d/%d) ns=%d(%.2f) eq=%d gate=%.0f comp=%.0f gain=%.1f dump=%d",
 	     c.enabled, c.chain.source_dsp ? "dsp" : "raw", c.chain.mic_w[0], c.chain.mic_w[1],
-	     c.chain.mic_w[2], c.chain.aec, c.chain.ns, c.chain.ns_mix, neq,
+	     c.chain.mic_w[2], c.chain.aec, c.chain.aec_stereo, c.chain.aec_tail_ms,
+	     c.chain.aec_delay_auto ? "auto/" : "", c.chain.aec_delay_ms, c.chain.aec_res,
+	     c.chain.ref_sel[0], c.chain.ref_sel[1],
+	     c.chain.ns, c.chain.ns_mix, neq,
 	     c.chain.gate_db, c.chain.comp_thr_db, c.chain.gain_db, c.dump);
 }
 
@@ -260,38 +289,112 @@ static int ctl_set(const char *name, const char *value)
 	return ret;
 }
 
-// Codec TDM TX slot count. The stock firmware table sets 2 slots on every
-// codec power-up, so this is re-checked periodically.
-static void codec_ensure_6slot(void)
+// The codec driver's debug nodes latch an address on write and return that
+// word on read; a two-word write stores a value.
+static long node_read(const char *node, unsigned addr, int width)
 {
 	char buf[32];
-	int n = snprintf(buf, sizeof(buf), "0x%04x", TDM_CTRL1_REG);
-	int fd = open(CODEC_NODE, O_RDWR);
+	int fd = open(node, O_RDWR);
 	if (fd < 0)
-		return;
-	write(fd, buf, n);
+		return -1;
+	int n = snprintf(buf, sizeof(buf), "0x%0*x", width, addr);
+	if (write(fd, buf, n) != n) {
+		close(fd);
+		return -1;
+	}
 	lseek(fd, 0, SEEK_SET);
 	n = read(fd, buf, sizeof(buf) - 1);
-	buf[n > 0 ? n : 0] = 0;
-	unsigned cur = strtoul(buf, NULL, 16);
-	if (cur != TDM_CTRL1_6SLOT) {
-		n = snprintf(buf, sizeof(buf), "0x%04x 0x%04x", TDM_CTRL1_REG, TDM_CTRL1_6SLOT);
-		write(fd, buf, n);
-		LOGI("codec TDM ctrl1 0x%04x -> 0x%04x", cur, TDM_CTRL1_6SLOT);
-	}
 	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = 0;
+	return (long)strtoul(buf, NULL, 16);
+}
+
+static void node_write(const char *node, unsigned addr, unsigned val, int width)
+{
+	char buf[40];
+	int fd = open(node, O_WRONLY);
+	if (fd < 0)
+		return;
+	int n = snprintf(buf, sizeof(buf), "0x%0*x 0x%0*x", width, addr, width, val);
+	write(fd, buf, n);
+	close(fd);
+}
+
+static pthread_mutex_t g_codec_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_want_sel = -1;          // selector byte the chain expects (ch1 << 4 | ch0); -1 = not set yet
+static volatile int g_aec_reset;     // tap thread: the reference changed, start over
+static int g_codec_was_down;
+
+static void selectors_apply(int sel)
+{
+	char s0[4], s1[4];
+	snprintf(s0, sizeof(s0), "%d", sel & 0xf);
+	snprintf(s1, sizeof(s1), "%d", (sel >> 4) & 0xf);
+	ctl_set("MIC TO CHANNEL0", s0);
+	ctl_set("MIC TO CHANNEL1", s1);
+}
+
+// Suspend powers the codec down and resume reloads its firmware, which puts
+// the register table back (2 TX slots) and clears the DSP output selectors
+// without the driver replaying what the mixer had set. With the selectors at
+// 0 the DSP's processed mic lands on the slots the chain reads as the speaker
+// reference, and the echo canceller learns to remove the user's own voice.
+// So once a second: wait out a reload (is_dsp_mode N), then put back anything
+// the codec lost and restart the canceller if something was lost.
+static void codec_check(void)
+{
+	pthread_mutex_lock(&g_codec_lock);
+	char b[8];
+	int fd = open(DSP_MODE_NODE, O_RDONLY);
+	if (fd >= 0) {
+		int n = read(fd, b, sizeof(b) - 1);
+		close(fd);
+		if (n > 0 && b[0] != 'Y') {
+			if (!g_codec_was_down)
+				LOGI("codec DSP down (firmware reload), waiting");
+			g_codec_was_down = 1;
+			pthread_mutex_unlock(&g_codec_lock);
+			return;
+		}
+	}
+	int lost = 0;
+	long cur = node_read(CODEC_NODE, TDM_CTRL1_REG, 4);
+	if (cur >= 0 && cur != TDM_CTRL1_6SLOT) {
+		node_write(CODEC_NODE, TDM_CTRL1_REG, TDM_CTRL1_6SLOT, 4);
+		LOGI("codec TDM ctrl1 0x%04lx -> 0x%04x", cur, TDM_CTRL1_6SLOT);
+		lost = 1;
+	}
+	if (g_want_sel >= 0) {
+		long cfg = node_read(DSP_NODE, DSP_OUT_CONFIG, 8);
+		if (cfg >= 0 && (cfg & 0xff) != (unsigned)g_want_sel) {
+			selectors_apply(g_want_sel);
+			LOGI("dsp selectors 0x%02lx -> 0x%02x", cfg & 0xff, g_want_sel);
+			lost = 1;
+		}
+	}
+	if (lost || g_codec_was_down) {
+		ctl_set("PRI_TDM_TX_0 Channels", "Six");
+		g_aec_reset = 1;
+		g_codec_was_down = 0;
+	}
+	pthread_mutex_unlock(&g_codec_lock);
 }
 
 // What the DSP puts on slots 0/1: its processed mic (selectors 0) or the
 // speaker echo reference (3/4) that the AEC needs.
-static void dsp_select_slots(int want_ref)
+static void dsp_select_slots(const struct chain_conf *k)
 {
-	static int cur = -1;
-	if (cur == want_ref)
-		return;
-	cur = want_ref;
-	ctl_set("MIC TO CHANNEL0", want_ref ? "3" : "0");
-	ctl_set("MIC TO CHANNEL1", want_ref ? "4" : "0");
+	int sel = 0;
+	if (k->aec && !k->source_dsp)
+		sel = ((k->ref_sel[1] & 0xf) << 4) | (k->ref_sel[0] & 0xf);
+	pthread_mutex_lock(&g_codec_lock);
+	int changed = g_want_sel != sel;
+	g_want_sel = sel;
+	pthread_mutex_unlock(&g_codec_lock);
+	if (changed)
+		selectors_apply(sel);
 }
 
 // ---- debug dump --------------------------------------------------------------
@@ -444,7 +547,9 @@ static void *tap_main(void *arg)
 			// slow for the capture loop: drop the PCM around it. Everything
 			// else (EQ, gain, dynamics) is cheap and applies in place.
 			int heavy = k.aec != cur.aec || k.ns != cur.ns || k.source_dsp != cur.source_dsp ||
-				    k.aec_tail_ms != cur.aec_tail_ms || k.aec_delay_ms != cur.aec_delay_ms;
+				    k.aec_tail_ms != cur.aec_tail_ms || k.aec_delay_ms != cur.aec_delay_ms ||
+				    k.aec_stereo != cur.aec_stereo || k.aec_res != cur.aec_res ||
+				    k.aec_res_db != cur.aec_res_db || k.aec_res_active_db != cur.aec_res_active_db;
 			if (memcmp(&k, &cur, sizeof(k))) {
 				if (heavy && fd >= 0) {
 					close(fd);
@@ -452,7 +557,7 @@ static void *tap_main(void *arg)
 					have = 0;
 				}
 				chain_configure(chain, &k);
-				dsp_select_slots(k.aec && !k.source_dsp);
+				dsp_select_slots(&k);
 				cur = k;
 			}
 		}
@@ -516,14 +621,21 @@ static void *tap_main(void *arg)
 					break;
 			}
 		}
+		if (g_aec_reset) {
+			g_aec_reset = 0;
+			chain_reset_aec(chain);
+			LOGI("echo canceller restarted after codec reload");
+		}
 		chain_process(chain, buf, mono);
-		if (g_conf.dump == 2)
+		// dump_write also closes the file once dump goes back to 0
+		if (g_conf.dump != 1)
 			dump_write(buf, sizeof(buf));
 		if (g_conf.debug && since_check % 100 == 50) {
 			struct chain_levels l;
 			chain_levels(chain, &l);
-			LOGI("levels dBFS: sum %.1f ref %.1f aec %.1f ns %.1f eq %.1f out %.1f",
-			     l.sum, l.ref, l.aec, l.ns, l.eq, l.out);
+			LOGI("levels dBFS: sum %.1f ref %.1f aec %.1f ns %.1f eq %.1f out %.1f | delay %.1f ms meas %.1f ms corr %.2f resets %d",
+			     l.sum, l.ref, l.aec, l.ns, l.eq, l.out, l.aec_delay * 1000.0f / CHAIN_RATE,
+			     l.aec_delay_meas * 1000.0f / CHAIN_RATE, l.aec_corr, l.aec_resets);
 		}
 
 		pthread_mutex_lock(&g_ring_lock);
@@ -633,7 +745,7 @@ static void *chain_builder(void *arg)
 	pthread_mutex_unlock(&g_conf_lock);
 	struct chain *n = chain_create();
 	chain_configure(n, &k);
-	dsp_select_slots(k.aec && !k.source_dsp);
+	dsp_select_slots(&k);
 	pthread_mutex_lock(&g_streams_lock);
 	c->pending = n;
 	c->builder_gen = gen;
@@ -739,14 +851,14 @@ static ssize_t wrapped_read(struct audio_stream_in *stream, void *buffer, size_t
 	g_tap_pause = 0;
 	conf_reload();
 	{
-		// the stock firmware table resets the codec to 2 TX slots on every
-		// power-up, so re-check about once a second from here, off the
-		// capture thread (it is an I2C transaction through the DSP)
+		// the codec loses our settings on every power cycle, so re-check
+		// about once a second from here, off the capture thread (they are
+		// I2C transactions through the DSP)
 		static uint64_t frames_since_check;
 		frames_since_check += (size_t)got / (2 * c->channels);
 		if (frames_since_check >= CHAIN_RATE) {
 			frames_since_check = 0;
-			codec_ensure_6slot();
+			codec_check();
 		}
 	}
 
@@ -790,7 +902,7 @@ static int wrapped_open_input_stream(struct audio_hw_device *dev, audio_io_handl
 	conf_reload();
 	g_tap_pause = 1;
 	ctl_set("PRI_TDM_TX_0 Channels", "Six");
-	codec_ensure_6slot();
+	codec_check();
 
 	// Preferred: have the stock HAL capture all six slots on this stream so
 	// there is one capture path that lives and dies with the app's stream.
@@ -920,7 +1032,7 @@ static int wrapped_open(const struct hw_module_t *module, const char *id, struct
 	LOGI("stock HAL opened, input hooks installed (api 0x%x)", adev->common.version);
 	if (g_conf.debug) {
 		ctl_set("PRI_TDM_TX_0 Channels", "Six");
-		codec_ensure_6slot();
+		codec_check();
 		pthread_mutex_lock(&g_streams_lock);
 		tap_launch();
 		pthread_mutex_unlock(&g_streams_lock);

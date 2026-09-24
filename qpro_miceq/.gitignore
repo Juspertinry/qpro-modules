@@ -7,3 +7,5 @@ tools/pcmrec
 tools/pcmplay
 tools/dspmem
 hal/audio.primary.kona.so
+hal/chain_test
+hal/chain_test.exe

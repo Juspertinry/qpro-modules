@@ -15,7 +15,7 @@ chmod 644 $D/stock.so $D/wrapper.so; chmod 666 $D/miceq.conf
 chcon u:object_r:vendor_file:s0 $D/stock.so $D/wrapper.so 2>/dev/null
 mount --bind $D/stock.so $S || exit 1
 mount --bind $D/wrapper.so $K || exit 1
-chmod 666 /sys/devices/platform/soc/a80000.i2c/i2c-0/0-002d/cm7120codec
+chmod 666 /sys/devices/platform/soc/a80000.i2c/i2c-0/0-002d/cm7120codec /sys/devices/platform/soc/a80000.i2c/i2c-0/0-002d/cm7120dsp
 logcat -c
 start vendor.audio-hal; start audioserver
 sleep 6

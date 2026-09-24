@@ -37,7 +37,7 @@ cp $MODDIR/presets/*.conf $CONF/presets/
 chmod 777 $CONF $CONF/presets; chmod 666 $CONF/miceq.conf $CONF/presets/*.conf
 
 # The wrapper re-applies the codec's 6-slot TDM setting after every sleep.
-chmod 666 $CODEC
+chmod 666 $CODEC $(dirname $CODEC)/cm7120dsp
 
 mount -o bind $MODDIR/stock.so $S || { log -t $TAG "bind mount of stock failed"; exit 1; }
 mount -o bind $MODDIR/audio.primary.kona.so $K || { log -t $TAG "bind mount of wrapper failed"; umount $S; exit 1; }

@@ -7,6 +7,7 @@
 
 #include <rnnoise.h>
 #include <speex/speex_echo.h>
+#include <speex/speex_preprocess.h>
 
 #include "chain.h"
 
@@ -15,15 +16,32 @@ struct biquad {
 	float z1, z2;
 };
 
+// Delay estimator: mic and reference decimated to 8 kHz, half a second of
+// each, cross-correlated over 0..80 ms of mic lead. The reference comes out
+// of the codec DSP about 35 ms after the echo reaches the mics, so the mics
+// are delayed to match; measuring it keeps the filter's first tap on the
+// direct path if the DSP path ever changes (firmware, sample rate, mode).
+#define DE_DEC 6
+#define DE_WIN (CHAIN_RATE / DE_DEC / 2)
+#define DE_MAXLAG (80 * CHAIN_RATE / DE_DEC / 1000)
+#define DE_MARGIN (2 * CHAIN_RATE / 1000)
+#define DL_N (CHAIN_MAX_DELAY_MS * CHAIN_RATE / 1000 + CHAIN_FRAME)
+
 struct chain {
 	struct chain_conf conf;
 	int configured;
 
-	// alignment delay line (mono)
-	float delay[CHAIN_MAX_DELAY_MS * CHAIN_RATE / 1000 + CHAIN_FRAME];
-	int delay_len, delay_pos;
+	// alignment delay line (mono ring, read delay_len behind the write point)
+	float dl[DL_N];
+	int dl_w, delay_len;
+
+	float de_mic[DE_WIN], de_ref[DE_WIN];
+	int de_fill;
+	int de_last;           // previous estimate, samples at 48 kHz
+	int de_agree;
 
 	SpeexEchoState *aec;
+	SpeexPreprocessState *pp;
 	DenoiseState *ns;
 
 	struct biquad eq[CHAIN_MAX_EQ];
@@ -120,11 +138,67 @@ void chain_destroy(struct chain *c)
 {
 	if (!c)
 		return;
+	if (c->pp)
+		speex_preprocess_state_destroy(c->pp);
 	if (c->aec)
 		speex_echo_state_destroy(c->aec);
 	if (c->ns)
 		rnnoise_destroy(c->ns);
 	free(c);
+}
+
+static void set_delay(struct chain *c, int samples)
+{
+	if (samples < 0) samples = 0;
+	if (samples > CHAIN_MAX_DELAY_MS * CHAIN_RATE / 1000) samples = CHAIN_MAX_DELAY_MS * CHAIN_RATE / 1000;
+	c->delay_len = samples;
+	c->lv.aec_delay = samples;
+}
+
+void chain_reset_aec(struct chain *c)
+{
+	if (c->aec)
+		speex_echo_state_reset(c->aec);
+	c->de_fill = 0;
+	c->de_last = -1;
+	c->lv.aec_delay_meas = -1;
+}
+
+// Returns the mic lead over the reference in 48 kHz samples, or -1 when the
+// window has no usable correlation (no playback, or too little of it).
+static int estimate_delay(struct chain *c)
+{
+	const float *m = c->de_mic, *r = c->de_ref;
+	double em = 0, er = 0;
+	for (int i = 0; i < DE_WIN; i++) {
+		em += (double)m[i] * m[i];
+		er += (double)r[i] * r[i];
+	}
+	// no playback (reference under -55 dBFS) means nothing to measure; the
+	// mic side can be much quieter than that at low volume, so only rule
+	// out silence there and let the correlation quality decide
+	if (er / DE_WIN < 32768.0 * 32768.0 * 3.2e-6 || em / DE_WIN < 32768.0 * 32768.0 * 1e-8)
+		return -1;
+	int best = -1;
+	double bestc = 0, sumsq = 0;
+	int n = DE_WIN - DE_MAXLAG;
+	for (int lag = 0; lag < DE_MAXLAG; lag++) {
+		float acc = 0;
+		const float *rr = r + lag;
+		for (int i = 0; i < n; i++)
+			acc += m[i] * rr[i];
+		double cc = fabs(acc) / sqrt(em * er);
+		sumsq += cc * cc;
+		if (cc > bestc) {
+			bestc = cc;
+			best = lag;
+		}
+	}
+	double noise = sqrt(sumsq / DE_MAXLAG);
+	c->lv.aec_corr = (float)bestc;
+	if (bestc < 0.08 || bestc < 4 * noise)
+		return -1;
+	return best * DE_DEC;
 }
 
 void chain_configure(struct chain *c, const struct chain_conf *conf)
@@ -134,22 +208,44 @@ void chain_configure(struct chain *c, const struct chain_conf *conf)
 	c->conf = *conf;
 	c->configured = 1;
 
-	int d = conf->aec ? conf->aec_delay_ms : 0;
-	if (d < 0) d = 0;
-	if (d > CHAIN_MAX_DELAY_MS) d = CHAIN_MAX_DELAY_MS;
-	c->delay_len = d * CHAIN_RATE / 1000;
-	c->delay_pos = 0;
-	memset(c->delay, 0, sizeof(c->delay));
+	set_delay(c, (conf->aec ? conf->aec_delay_ms : 0) * CHAIN_RATE / 1000);
+	c->de_fill = 0;
+	c->de_last = -1;
+	c->de_agree = 0;
+	c->lv.aec_delay_meas = -1;
+	c->lv.aec_corr = 0;
 
+	if (c->pp) {
+		speex_preprocess_state_destroy(c->pp);
+		c->pp = NULL;
+	}
 	if (c->aec) {
 		speex_echo_state_destroy(c->aec);
 		c->aec = NULL;
 	}
 	if (conf->aec) {
-		int tail = (conf->aec_tail_ms > 0 ? conf->aec_tail_ms : 64) * CHAIN_RATE / 1000;
-		c->aec = speex_echo_state_init(CHAIN_FRAME, tail);
+		int tail = (conf->aec_tail_ms > 0 ? conf->aec_tail_ms : 32) * CHAIN_RATE / 1000;
+		c->aec = speex_echo_state_init_mc(CHAIN_FRAME, tail, 1, conf->aec_stereo ? 2 : 1);
 		int rate = CHAIN_RATE;
 		speex_echo_ctl(c->aec, SPEEX_ECHO_SET_SAMPLING_RATE, &rate);
+		if (conf->aec_res) {
+			// Speex only applies its echo floor inside the denoise stage, so
+			// that stays on with 0 dB of noise suppression: bins the filter
+			// says are residual echo get pushed down, everything else passes
+			// untouched and RNNoise remains the noise suppressor.
+			c->pp = speex_preprocess_state_init(CHAIN_FRAME, CHAIN_RATE);
+			spx_int32_t on = 1, off = 0, zero = 0;
+			spx_int32_t sup = conf->aec_res_db ? conf->aec_res_db : -40;
+			spx_int32_t act = conf->aec_res_active_db ? conf->aec_res_active_db : -15;
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_DENOISE, &on);
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &zero);
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_AGC, &off);
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_VAD, &off);
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_DEREVERB, &off);
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_STATE, c->aec);
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &sup);
+			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &act);
+		}
 	}
 
 	if (!c->ns && conf->ns)
@@ -191,24 +287,61 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out)
 		c->lv.ref = lvl(r, CHAIN_FRAME, 1);
 	}
 
-	// alignment delay so the DSP-side echo reference leads the echo
-	if (c->delay_len > 0) {
-		for (int i = 0; i < CHAIN_FRAME; i++) {
-			float v = c->delay[c->delay_pos];
-			c->delay[c->delay_pos] = x[i];
-			x[i] = v;
-			if (++c->delay_pos >= c->delay_len)
-				c->delay_pos = 0;
+	// track the mic-to-reference offset from the undelayed signals
+	if (c->aec && k->aec_delay_auto) {
+		for (int i = 0; i < CHAIN_FRAME; i += DE_DEC) {
+			float sm = 0, sr = 0;
+			for (int j = 0; j < DE_DEC; j++) {
+				const int16_t *f = tap + (i + j) * CHAIN_TAP_CH;
+				sm += x[i + j];
+				sr += f[0] + f[1];
+			}
+			c->de_mic[c->de_fill] = sm / DE_DEC;
+			c->de_ref[c->de_fill] = sr / DE_DEC;
+			if (++c->de_fill == DE_WIN) {
+				c->de_fill = 0;
+				int d = estimate_delay(c);
+				c->lv.aec_delay_meas = d;
+				// two windows in a row within 2 ms of each other, and more
+				// than 2 ms off what is in use: move and let the filter restart
+				// (the tail absorbs anything smaller, a restart costs more)
+				if (d >= 0 && c->de_last >= 0 && abs(d - c->de_last) <= 2 * DE_DEC) {
+					if (abs(d + DE_MARGIN - c->delay_len) > 2 * CHAIN_RATE / 1000) {
+						set_delay(c, d + DE_MARGIN);
+						speex_echo_state_reset(c->aec);
+					}
+				}
+				c->de_last = d;
+			}
 		}
 	}
 
-	// echo cancellation against the reference the DSP dumps on slots 0/1
+	// alignment delay so the DSP-side echo reference leads the echo
+	for (int i = 0; i < CHAIN_FRAME; i++) {
+		c->dl[c->dl_w] = x[i];
+		x[i] = c->dl[(c->dl_w - c->delay_len + DL_N) % DL_N];
+		if (++c->dl_w == DL_N)
+			c->dl_w = 0;
+	}
+
+	// echo cancellation against the reference the DSP dumps on slots 0/1,
+	// one filter per speaker when stereo
 	if (c->aec) {
-		int16_t rec[CHAIN_FRAME], play[CHAIN_FRAME], est[CHAIN_FRAME];
+		int16_t rec[CHAIN_FRAME], play[2 * CHAIN_FRAME], est[CHAIN_FRAME];
 		for (int i = 0; i < CHAIN_FRAME; i++) {
 			float v = x[i];
 			rec[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
-			play[i] = (tap[i * CHAIN_TAP_CH + 0] + tap[i * CHAIN_TAP_CH + 1]) / 2;
+			const int16_t *f = tap + i * CHAIN_TAP_CH;
+			if (k->aec_stereo) {
+				play[2 * i] = f[0];
+				play[2 * i + 1] = f[1];
+			} else {
+				// the codec only ever fills one of the two reference
+				// slots (selector 4 stays silent), so sum rather than
+				// average and the reference keeps its level
+				int s = f[0] + f[1];
+				play[i] = s > 32767 ? 32767 : s < -32768 ? -32768 : (int16_t)s;
+			}
 		}
 		speex_echo_cancellation(c->aec, rec, play, est);
 		// an adaptive filter that diverges makes things louder, never
@@ -222,6 +355,8 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out)
 			speex_echo_state_reset(c->aec);
 			c->lv.aec_resets++;
 		} else {
+			if (c->pp)
+				speex_preprocess_run(c->pp, est);
 			for (int i = 0; i < CHAIN_FRAME; i++)
 				x[i] = est[i];
 		}
