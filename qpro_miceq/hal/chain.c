@@ -360,9 +360,16 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out)
 			in_e += (float)rec[i] * rec[i];
 			out_e += (float)est[i] * est[i];
 		}
+		{
+			float m[CHAIN_FRAME];
+			for (int i = 0; i < CHAIN_FRAME; i++)
+				m[i] = est[i];
+			c->lv.mdf = lvl(m, CHAIN_FRAME, 1);
+		}
 		if (out_e > in_e * 2.0f + 1e3f) {
 			speex_echo_state_reset(c->aec);
 			c->lv.aec_resets++;
+			c->lv.resets_div++;
 		} else {
 			if (c->pp)
 				speex_preprocess_run(c->pp, est);
@@ -376,6 +383,7 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out)
 				chain_reset_aec(c);
 				pp_setup(c);
 				c->lv.aec_resets++;
+				c->lv.resets_zero++;
 			} else {
 				for (int i = 0; i < CHAIN_FRAME; i++)
 					x[i] = est[i];

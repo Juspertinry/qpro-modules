@@ -17,7 +17,7 @@ int main(int argc, char **argv)
 	memset(&k, 0, sizeof(k));
 	k.mic_w[0] = k.mic_w[1] = k.mic_w[2] = 1.0f / 3;
 	k.aec = 1; k.aec_stereo = 0; k.aec_tail_ms = 32; k.aec_delay_ms = 37; k.aec_delay_auto = 1;
-	k.aec_res = 1; k.aec_res_db = -40; k.aec_res_active_db = -15;
+	k.aec_res = 0; k.aec_res_db = -40; k.aec_res_active_db = -15;
 	k.ns = 0; k.ns_mix = 1;
 	for (int i = 3; i < argc; i++) {
 		char *eq = strchr(argv[i], '=');

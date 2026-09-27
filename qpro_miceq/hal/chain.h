@@ -52,8 +52,9 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out);
 void chain_reset_aec(struct chain *c);
 // Levels (dBFS) of the last processed frame at each stage, for debugging.
 struct chain_levels {
-	float sum, ref, aec, ns, eq, out;
-	int aec_resets;
+	float sum, ref, mdf, aec, ns, eq, out;   // mdf: after the linear filter, aec: after residual suppression
+	int aec_resets;        // total; split below
+	int resets_div, resets_zero;
 	int aec_delay;         // mic delay in use, samples
 	int aec_delay_meas;    // last measured mic lead over the reference, samples (-1: none)
 	float aec_corr;        // normalized correlation of that measurement

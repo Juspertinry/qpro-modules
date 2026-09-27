@@ -82,7 +82,7 @@ static void conf_defaults(struct conf *c)
 	c->chain.aec_tail_ms = 32;
 	c->chain.aec_delay_ms = 37;
 	c->chain.aec_delay_auto = 1;
-	c->chain.aec_res = 1;
+	c->chain.aec_res = 0;
 	c->chain.aec_res_db = -40;
 	c->chain.aec_res_active_db = -15;
 	c->chain.ns_mix = 1;
@@ -636,9 +636,9 @@ static void *tap_main(void *arg)
 		if (g_conf.debug && since_check % 100 == 50) {
 			struct chain_levels l;
 			chain_levels(chain, &l);
-			LOGI("levels dBFS: sum %.1f ref %.1f aec %.1f ns %.1f eq %.1f out %.1f | delay %.1f ms meas %.1f ms corr %.2f resets %d",
-			     l.sum, l.ref, l.aec, l.ns, l.eq, l.out, l.aec_delay * 1000.0f / CHAIN_RATE,
-			     l.aec_delay_meas * 1000.0f / CHAIN_RATE, l.aec_corr, l.aec_resets);
+			LOGI("levels dBFS: sum %.1f ref %.1f mdf %.1f aec %.1f ns %.1f eq %.1f out %.1f | delay %.1f ms meas %.1f ms corr %.2f resets div %d zero %d",
+			     l.sum, l.ref, l.mdf, l.aec, l.ns, l.eq, l.out, l.aec_delay * 1000.0f / CHAIN_RATE,
+			     l.aec_delay_meas * 1000.0f / CHAIN_RATE, l.aec_corr, l.resets_div, l.resets_zero);
 		}
 
 		pthread_mutex_lock(&g_ring_lock);
