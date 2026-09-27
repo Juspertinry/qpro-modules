@@ -155,6 +155,32 @@ static void set_delay(struct chain *c, int samples)
 	c->lv.aec_delay = samples;
 }
 
+// Residual echo suppressor. Speex only applies its echo floor inside the
+// denoise stage, so that stays on with 0 dB of noise suppression: bins the
+// filter says are residual echo get pushed down, everything else passes
+// untouched and RNNoise remains the noise suppressor.
+static void pp_setup(struct chain *c)
+{
+	if (c->pp) {
+		speex_preprocess_state_destroy(c->pp);
+		c->pp = NULL;
+	}
+	if (!c->aec || !c->conf.aec_res)
+		return;
+	c->pp = speex_preprocess_state_init(CHAIN_FRAME, CHAIN_RATE);
+	spx_int32_t on = 1, off = 0, zero = 0;
+	spx_int32_t sup = c->conf.aec_res_db ? c->conf.aec_res_db : -40;
+	spx_int32_t act = c->conf.aec_res_active_db ? c->conf.aec_res_active_db : -15;
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_DENOISE, &on);
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &zero);
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_AGC, &off);
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_VAD, &off);
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_DEREVERB, &off);
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_STATE, c->aec);
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &sup);
+	speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &act);
+}
+
 void chain_reset_aec(struct chain *c)
 {
 	if (c->aec)
@@ -228,24 +254,7 @@ void chain_configure(struct chain *c, const struct chain_conf *conf)
 		c->aec = speex_echo_state_init_mc(CHAIN_FRAME, tail, 1, conf->aec_stereo ? 2 : 1);
 		int rate = CHAIN_RATE;
 		speex_echo_ctl(c->aec, SPEEX_ECHO_SET_SAMPLING_RATE, &rate);
-		if (conf->aec_res) {
-			// Speex only applies its echo floor inside the denoise stage, so
-			// that stays on with 0 dB of noise suppression: bins the filter
-			// says are residual echo get pushed down, everything else passes
-			// untouched and RNNoise remains the noise suppressor.
-			c->pp = speex_preprocess_state_init(CHAIN_FRAME, CHAIN_RATE);
-			spx_int32_t on = 1, off = 0, zero = 0;
-			spx_int32_t sup = conf->aec_res_db ? conf->aec_res_db : -40;
-			spx_int32_t act = conf->aec_res_active_db ? conf->aec_res_active_db : -15;
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_DENOISE, &on);
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &zero);
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_AGC, &off);
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_VAD, &off);
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_DEREVERB, &off);
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_STATE, c->aec);
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &sup);
-			speex_preprocess_ctl(c->pp, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &act);
-		}
+		pp_setup(c);
 	}
 
 	if (!c->ns && conf->ns)
@@ -357,8 +366,20 @@ void chain_process(struct chain *c, const int16_t *tap, int16_t *out)
 		} else {
 			if (c->pp)
 				speex_preprocess_run(c->pp, est);
+			// exact silence out of a live input means the float state went
+			// bad (NaN turns into 0 on the way back to 16-bit) and would stay
+			// that way for good: throw both states away
+			out_e = 0;
 			for (int i = 0; i < CHAIN_FRAME; i++)
-				x[i] = est[i];
+				out_e += (float)est[i] * est[i];
+			if (in_e > 1e4f && out_e == 0) {
+				chain_reset_aec(c);
+				pp_setup(c);
+				c->lv.aec_resets++;
+			} else {
+				for (int i = 0; i < CHAIN_FRAME; i++)
+					x[i] = est[i];
+			}
 		}
 	}
 	c->lv.aec = lvl(x, CHAIN_FRAME, 1);
