@@ -342,7 +342,9 @@ static void selectors_apply(int sel)
 // 0 the DSP's processed mic lands on the slots the chain reads as the speaker
 // reference, and the echo canceller learns to remove the user's own voice.
 // So once a second: wait out a reload (is_dsp_mode N), then put back anything
-// the codec lost and restart the canceller if something was lost.
+// the codec lost and restart the canceller if something was lost. Runs from
+// the read path, so only while something is listening, which is also the
+// only time it matters.
 static void codec_check(void)
 {
 	pthread_mutex_lock(&g_codec_lock);
@@ -374,8 +376,9 @@ static void codec_check(void)
 			lost = 1;
 		}
 	}
+	// the backend channel count lives on the ADSP side and survives a codec
+	// power cycle; writing it here would restart the backend for nothing
 	if (lost || g_codec_was_down) {
-		ctl_set("PRI_TDM_TX_0 Channels", "Six");
 		g_aec_reset = 1;
 		g_codec_was_down = 0;
 	}
