@@ -1,0 +1,3 @@
+# Built zips are attached to Releases, not committed.
+dist/
+*.zip
