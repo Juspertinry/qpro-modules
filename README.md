@@ -9,3 +9,4 @@ This is also shown for 90 seconds when the device is put to sleep and not chargi
 - MicEQ is a custom microphone stack replacement that aims to improve the quality, enhance noise cancelation, and give you a less tinny sounding voice. Makes use of SpeexDSP and RNNoise.
 
 - Grayscale allows you to toggle on/off the Quest Pro "colorizer" camera from Magisk via the Action button without rebooting the device.
+Supported versions are ``51503870024400340``, ``51463340027700340``, ``51483620032400340``
