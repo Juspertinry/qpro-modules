@@ -1,6 +1,6 @@
 id=qpro_grayscale_passthrough
 name=Quest Pro Grayscale Passthrough
-version=v1.1.0
-versionCode=2
+version=v1.2.0
+versionCode=3
 author=Juspertinry
-description=Action button toggles grayscale passthrough from the mono tracking cameras (IR sensitive, works in the dark) and restarts the MR engine and VR shell. Persists across reboots. HorizonOS v207 only.
+description=Action button toggles grayscale passthrough from the mono tracking cameras (IR sensitive, works in the dark) and restarts the MR engine and VR shell. Persists across reboots. Supports builds 51503870024400340 and 51463340027700340.

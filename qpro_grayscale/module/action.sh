@@ -23,9 +23,8 @@ if is_mounted; then
     umount_gray || { echo "! unmount failed"; exit 1; }
     rm -f "$STATE"
 else
-    cur=$(lib_sha)
-    if [ "$cur" != "$STOCK_SHA" ]; then
-        echo "! libmrengine.so isn't the v207 stock build, refusing"
+    if ! make_patched; then
+        echo "! libmrengine.so isn't a supported build ($(getprop ro.build.version.incremental)), refusing"
         exit 1
     fi
     echo "- Switching to GRAYSCALE passthrough"
