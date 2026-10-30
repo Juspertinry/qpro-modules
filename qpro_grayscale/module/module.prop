@@ -1,6 +1,6 @@
 id=qpro_grayscale_passthrough
 name=Quest Pro Grayscale Passthrough
-version=v1.2.0
-versionCode=3
+version=v1.3.0
+versionCode=4
 author=Juspertinry
-description=Action button toggles grayscale passthrough from the mono tracking cameras (IR sensitive, works in the dark) and restarts the MR engine and VR shell. Persists across reboots. Supports builds 51503870024400340 and 51463340027700340.
+description=Action button toggles grayscale passthrough from the mono tracking cameras (IR sensitive, works in the dark) and restarts the MR engine and VR shell. Persists across reboots. Supports builds 51503870024400340, 51463340027700340 and 51483620032400340.
